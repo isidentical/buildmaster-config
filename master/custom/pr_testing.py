@@ -6,8 +6,10 @@ from dateutil.parser import parse as dateparse
 from twisted.internet import defer
 from twisted.python import log
 
+from buildbot.util import httpclientservice
 from buildbot.www.hooks.github import GitHubEventHandler
 
+TESTING_PREFIX = "!buildbot"
 TESTING_LABEL = ":hammer: test-with-buildbots"
 
 GITHUB_PROPERTIES_WHITELIST = ["*.labels"]
@@ -25,6 +27,49 @@ def should_pr_be_tested(change):
 
 
 class CustomGitHubEventHandler(GitHubEventHandler):
+
+    @defer.inlineCallbacks
+    def handle_issue_comment(self, payload, event):
+        comment = payload["comment"]["body"].split()
+        log.msg(f"Handled comment: {comment}")
+
+        if payload.get("action") != "created":
+            return ([], "git")
+
+        if len(comment) < 2 and comment[0] != TESTING_PREFIX:
+            return ([], "git")
+
+        pull_request = payload["issue"].get("pull_request")
+        if pull_request is None:
+            return ([], "git")
+        else:
+            pull_request = pull_request["url"].replace(self.github_api_endpoint, "")
+
+        headers = {
+            'User-Agent': 'Buildbot'
+        }
+        if self._token:
+            headers['Authorization'] = 'token ' + self._token
+
+        http = yield httpclientservice.HTTPClientService.getService(
+            self.master, self.github_api_endpoint, headers=headers,
+            debug=self.debug, verify=self.verify)
+
+        pr_payload = {}
+        pr_payload["action"] = "commented"
+        pr_payload["sender"] = payload["sender"].copy()
+        pr_payload["number"] = payload["issue"]["number"]
+        pr_payload["repository"] = payload["repository"].copy()
+
+        pull_request_object = yield http.get(pull_request)
+        pr_payload["pull_request"] = yield pull_request_object.json()
+
+        changes, vcs = yield self.handle_pull_request(pr_payload, event)
+        changes[0]["properties"].update({"is_comment": True})
+        changes[0]["properties"].update({"action": comment[1]}) # ex: @mycustombot [run] x y
+        changes[0]["properties"].update({"bots": comment[2:]}) # ex: @mycustombot run [x y]
+        return changes, vcs
+
     @defer.inlineCallbacks
     def handle_pull_request(self, payload, event):
         changes = []
@@ -48,7 +93,7 @@ class CustomGitHubEventHandler(GitHubEventHandler):
             return ([], "git")
 
         action = payload.get("action")
-        if action not in ("opened", "reopened", "synchronize", "labeled"):
+        if action not in ("opened", "reopened", "synchronize", "labeled", "commented"):
             log.msg("GitHub PR #{} {}, ignoring".format(number, action))
             return (changes, "git")
 
